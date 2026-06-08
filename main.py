@@ -3,10 +3,13 @@ Faculty Workload and Scheduling Application
 --------------------------------------------
 A PyQt5-based desktop app to manage faculty workloads, course assignments,
 and scheduling with conflict detection, data persistence via SQLite,
-and PDF/CSV export.
+and PDF/CSV/PNG export.
 
-Features: semester/term management, in-place editing, bulk import from CSV,
-room/location tracking, weekly schedule view, dark/light theme toggle.
+Features:
+  - Semester/term management, in-place editing, bulk CSV import, room tracking
+  - Weekly schedule view (dialog), schedule PDF export, timetable PNG export
+  - Auto-scheduler: greedy load-balanced course assignment suggestions
+  - Google Calendar sync: push courses as calendar events via OAuth2
 
 Author: Ulysses Cabayao, SJ (uscabayaosj@addu.edu.ph)
 """
@@ -18,7 +21,10 @@ import logging
 import tempfile
 import sqlite3
 import csv
+import webbrowser
+import json
 from copy import deepcopy
+from collections import defaultdict
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -26,15 +32,22 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QMessageBox, QFileDialog, QStyleFactory,
     QHeaderView, QMenu, QAbstractItemView, QCheckBox, QGroupBox,
     QFrame, QGridLayout, QSplitter, QDialog, QDialogButtonBox,
-    QFormLayout, QDateEdit, QTabWidget, QTextEdit, QSizePolicy,
-    QScrollArea
+    QFormLayout, QScrollArea, QProgressDialog, QTextEdit,
+    QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer, QDate
-from PyQt5.QtGui import QFont, QPalette, QColor, QBrush, QIcon
+from PyQt5.QtCore import Qt, QTimer, QDate, QSize
+from PyQt5.QtGui import (
+    QFont, QPalette, QColor, QBrush, QIcon, QPixmap, QPainter,
+    QTextDocument, QPageSize, QPageLayout
+)
 from reportlab.lib import colors as rl_colors
-from reportlab.lib.pagesizes import letter, landscape
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Spacer, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import letter, landscape, A4
+from reportlab.lib.units import inch, mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Table as RLTable, TableStyle, Spacer, Paragraph, PageBreak
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -56,7 +69,7 @@ log = logging.getLogger(__name__)
 log.info("Application starting — Python %s", sys.version)
 
 # ---------------------------------------------------------------------------
-# Temp directory setup (relevant when frozen via PyInstaller)
+# Temp directory setup
 # ---------------------------------------------------------------------------
 
 def get_temp_dir():
@@ -89,12 +102,18 @@ SCHEDULE_SLOTS = [
     "TTh 03:45pm-05:15pm", "TTh 05:50pm-07:20pm", "TTh 07:30pm-09:00pm",
     "Sat 09:00am-12:00pm", "Sat 01:00pm-04:00pm", "Sat 05:00pm-08:00pm",
 ]
-# Day headers for weekly schedule
 DAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 DAY_CODES = {"MW": (0, 2), "TTh": (1, 3), "Sat": (4,)}
-# Ordered timeslots for schedule view (extract unique time ranges)
-UNIQUE_TIMES = sorted(set(s.split(None, 1)[1] for s in SCHEDULE_SLOTS if ' ' in s),
-                      key=lambda t: datetime.datetime.strptime(t.split('-')[0].strip(), "%I:%M%p"))
+# Ordered timeslot labels for timetable grid
+TIMESLOT_LABELS = [
+    "07:40am-09:10am", "09:20am-10:50am", "12:25pm-01:55pm",
+    "02:05pm-03:35pm", "03:45pm-05:15pm", "05:50pm-07:20pm", "07:30pm-09:00pm",
+]
+SCHEDULE_TO_TIMESLOT = {}
+for s in SCHEDULE_SLOTS:
+    parts = s.split(None, 1)
+    if len(parts) == 2:
+        SCHEDULE_TO_TIMESLOT[s] = parts[1]
 
 # Theme palettes
 DARK_PALETTE = {
@@ -114,13 +133,16 @@ LIGHT_PALETTE = {
     'highlight': QColor(42, 130, 218), 'highlightedText': Qt.white,
 }
 
-# Status colours
 STATUS_COLORS = {
-    'under': QColor(255, 235, 59),       # amber
-    'on_target': QColor(76, 175, 80),    # green
-    'over': QColor(244, 67, 54),         # red
-    'part_time': QColor(158, 158, 158),  # grey
+    'under': QColor(255, 235, 59),
+    'on_target': QColor(76, 175, 80),
+    'over': QColor(244, 67, 54),
+    'part_time': QColor(158, 158, 158),
 }
+
+# Day grid labels for export
+GRID_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+GRID_DAY_INDICES = {"MW": [0, 2], "TTh": [1, 3], "Sat": [4]}
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -135,7 +157,6 @@ class Semester:
 
 class Course:
     __slots__ = ('name', 'year_level', 'units', 'schedule', 'room', 'semester_id', '_id')
-
     def __init__(self, name, year_level, units, schedule, room='', semester_id=None, db_id=None):
         self.name = name
         self.year_level = year_level
@@ -147,7 +168,6 @@ class Course:
 
 class Faculty:
     __slots__ = ('name', 'classification', 'is_admin', 'courses', 'required_load', '_id')
-
     def __init__(self, name, classification, is_admin=False, db_id=None):
         self.name = name
         self.classification = classification
@@ -187,8 +207,12 @@ class Faculty:
             return 'over'
         return 'on_target'
 
+    def remaining_capacity(self):
+        """How many more units this faculty can take before hitting target."""
+        return max(0, self.required_load - self.current_load())
+
 # ---------------------------------------------------------------------------
-# Database manager
+# Database
 # ---------------------------------------------------------------------------
 
 class Database:
@@ -229,7 +253,6 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_courses_semester ON courses(semester_id);
         """)
         self.conn.commit()
-        # Ensure at least one semester exists
         cur = self.conn.execute("SELECT COUNT(*) FROM semesters")
         if cur.fetchone()[0] == 0:
             year = datetime.date.today().year
@@ -240,7 +263,7 @@ class Database:
             self.conn.commit()
             log.info("Created default semester")
 
-    # -- Semester CRUD ------------------------------------------------------
+    # -- Semesters ----------------------------------------------------------
 
     def load_semesters(self):
         rows = self.conn.execute("SELECT * FROM semesters ORDER BY name").fetchall()
@@ -260,12 +283,11 @@ class Database:
         self.conn.commit()
 
     def delete_semester(self, semester_id):
-        # Move courses to null semester first
         self.conn.execute("UPDATE courses SET semester_id=NULL WHERE semester_id=?", (semester_id,))
         self.conn.execute("DELETE FROM semesters WHERE id=?", (semester_id,))
         self.conn.commit()
 
-    # -- Faculty CRUD -------------------------------------------------------
+    # -- Faculty ------------------------------------------------------------
 
     def load_all_faculty(self):
         rows = self.conn.execute("SELECT * FROM faculty ORDER BY name").fetchall()
@@ -273,10 +295,8 @@ class Database:
                 for r in rows]
 
     def load_courses_for_semester(self, semester_id, faculty_list):
-        """Load courses for a given semester into the faculty_list objects."""
         if not faculty_list:
             return
-        # Build faculty_id -> Faculty map
         fac_map = {f._id: f for f in faculty_list}
         rows = self.conn.execute(
             "SELECT * FROM courses WHERE semester_id=? ORDER BY name",
@@ -314,7 +334,7 @@ class Database:
         if row:
             self.delete_faculty(row['id'])
 
-    # -- Course CRUD --------------------------------------------------------
+    # -- Courses ------------------------------------------------------------
 
     def add_course(self, faculty_id, course):
         cur = self.conn.execute(
@@ -343,131 +363,512 @@ class Database:
         log.info("Database closed.")
 
 # ---------------------------------------------------------------------------
-# Weekly Schedule Dialog
+# Scheduling Optimizer (greedy load-balanced algorithm)
 # ---------------------------------------------------------------------------
 
-class WeeklyScheduleDialog(QDialog):
-    """A dialog that shows a weekly timetable grid for all faculty."""
+class ScheduleSuggestion:
+    """One proposed course-to-faculty assignment from the optimizer."""
 
-    TIMESLOT_LABELS = [
-        "07:40am-09:10am", "09:20am-10:50am", "12:25pm-01:55pm",
-        "02:05pm-03:35pm", "03:45pm-05:15pm", "05:50pm-07:20pm", "07:30pm-09:00pm",
-    ]
+    __slots__ = ('course_name', 'year_level', 'units', 'schedule', 'room',
+                 'suggested_faculty', 'reason', 'accepted')
 
-    def __init__(self, faculty_list, parent=None):
+    def __init__(self, course_name, year_level, units, schedule, room,
+                 suggested_faculty, reason):
+        self.course_name = course_name
+        self.year_level = year_level
+        self.units = units
+        self.schedule = schedule
+        self.room = room
+        self.suggested_faculty = suggested_faculty
+        self.reason = reason
+        self.accepted = False
+
+
+class SchedulingOptimizer:
+    """Greedy load-balanced scheduler.
+
+    Strategy:
+      1. Sort courses by priority (higher year levels first, then by units).
+      2. For each course, score eligible faculty by:
+         - Remaining capacity (closer to target = better)
+         - Lower current load = higher priority
+         - Part-time faculty get lowest priority
+      3. Assign to highest-scored faculty with no conflict.
+    """
+
+    @staticmethod
+    def optimize(unassigned_courses, faculty_list):
+        """Return list of ScheduleSuggestion objects.
+
+        Parameters
+        ----------
+        unassigned_courses : list of Course
+            Courses that need to be assigned.
+        faculty_list : list of Faculty
+            All faculty (including those already with courses loaded).
+        """
+        if not unassigned_courses or not faculty_list:
+            return []
+
+        # Work on copies so we don't mutate originals during scoring
+        suggestions = []
+
+        # Sort courses: higher year levels first, then more units first
+        def course_priority(c):
+            yr_order = YEAR_LEVELS.index(c.year_level) if c.year_level in YEAR_LEVELS else 99
+            # BA 4 > MA 2 > BA 1 (more advanced = higher priority for assignment)
+            return (-yr_order, -c.units)
+
+        sorted_courses = sorted(unassigned_courses, key=course_priority)
+
+        for course in sorted_courses:
+            best_faculty = None
+            best_score = -1
+            best_reason = ""
+
+            for fac in faculty_list:
+                # Skip if schedule conflict
+                if SchedulingOptimizer._has_conflict(fac, course):
+                    continue
+
+                # Part-time faculty: no load limit, but lowest priority
+                if fac.classification == "Part-time":
+                    score = 5
+                    reason = "Only available option (part-time)"
+                else:
+                    remaining = fac.remaining_capacity()
+                    if remaining <= 0 and fac.current_load() > 0:
+                        # Already at/over capacity — only consider if desperate
+                        score = 1
+                        reason = f"Over capacity ({fac.current_load()}/{fac.required_load})"
+                    else:
+                        # Score based on how close to target
+                        # Prefer faculty who need this course to reach target
+                        if remaining >= course.units:
+                            # This course fits perfectly
+                            fill_ratio = course.units / max(1, remaining)
+                            score = 50 + int(50 * fill_ratio)
+                            reason = f"Fits remaining capacity ({fac.current_load()}+{course.units}/{fac.required_load})"
+                        else:
+                            # Would cause overload but still has room
+                            score = 20 + max(0, 30 - fac.load_delta())
+                            reason = f"Would overload ({fac.current_load()}+{course.units}/{fac.required_load})"
+
+                if score > best_score:
+                    best_score = score
+                    best_faculty = fac
+                    best_reason = reason
+
+            if best_faculty:
+                suggestions.append(ScheduleSuggestion(
+                    course_name=course.name,
+                    year_level=course.year_level,
+                    units=course.units,
+                    schedule=course.schedule,
+                    room=course.room or '',
+                    suggested_faculty=best_faculty.name,
+                    reason=best_reason,
+                ))
+            else:
+                suggestions.append(ScheduleSuggestion(
+                    course_name=course.name,
+                    year_level=course.year_level,
+                    units=course.units,
+                    schedule=course.schedule,
+                    room=course.room or '',
+                    suggested_faculty="(none available)",
+                    reason="No eligible faculty found (all have conflicts or capacity issues)",
+                ))
+
+        return suggestions
+
+    @staticmethod
+    def _has_conflict(faculty, new_course):
+        """Check if new_course conflicts with any of faculty's existing courses."""
+        for c in faculty.courses:
+            if c.schedule == new_course.schedule:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Schedule Suggestions Dialog
+# ---------------------------------------------------------------------------
+
+class ScheduleSuggestDialog(QDialog):
+    """Dialog to review and accept/reject auto-scheduler suggestions."""
+
+    def __init__(self, suggestions, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Weekly Schedule View")
-        self.resize(1100, 700)
+        self.setWindowTitle("Auto-Schedule Suggestions")
+        self.resize(850, 600)
+        self.setModal(True)
+        self.suggestions = suggestions
+        self._init_ui()
 
+    def _init_ui(self):
         layout = QVBoxLayout(self)
 
-        # Faculty filter
-        filter_layout = QHBoxLayout()
-        filter_layout.addWidget(QLabel("Show faculty:"))
-        self.fac_filter = QComboBox()
-        self.fac_filter.addItem("All Faculty")
-        for f in faculty_list:
-            self.fac_filter.addItem(f.name)
-        self.fac_filter.currentIndexChanged.connect(self._rebuild)
-        filter_layout.addWidget(self.fac_filter)
-        filter_layout.addStretch()
-        layout.addLayout(filter_layout)
+        # Instructions
+        instructions = QLabel(
+            "Review suggested course assignments below. "
+            "Check/uncheck each suggestion to accept or reject it, then click Apply."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
 
-        # Scroll area for timetable
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        self.timetable_widget = QWidget()
-        self.timetable_layout = QVBoxLayout(self.timetable_widget)
-        scroll.setWidget(self.timetable_widget)
-        layout.addWidget(scroll)
+        # Table of suggestions
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(
+            ["Accept", "Course", "Year Level", "Units", "Schedule", "Room", "Suggested Faculty"]
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
 
-        self.faculty_list = faculty_list
-        self._rebuild()
+        self.table.setRowCount(len(self.suggestions))
+        for row, s in enumerate(self.suggestions):
+            # Checkbox column
+            cb_item = QTableWidgetItem()
+            cb_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            cb_item.setCheckState(Qt.Checked if "(none)" not in s.suggested_faculty else Qt.Unchecked)
+            self.table.setItem(row, 0, cb_item)
 
-    def _rebuild(self):
-        # Clear old content
-        while self.timetable_layout.count():
-            child = self.timetable_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            name_item = QTableWidgetItem(s.course_name)
+            name_item.setToolTip(s.reason)
+            if "(none)" in s.suggested_faculty:
+                name_item.setBackground(QColor(255, 200, 200))
+            self.table.setItem(row, 1, name_item)
+            self.table.setItem(row, 2, QTableWidgetItem(s.year_level))
+            self.table.setItem(row, 3, QTableWidgetItem(str(s.units)))
+            self.table.setItem(row, 4, QTableWidgetItem(s.schedule))
 
-        filter_name = self.fac_filter.currentText()
-        if filter_name == "All Faculty":
-            fac_list = self.faculty_list
-        else:
-            fac_list = [f for f in self.faculty_list if f.name == filter_name]
+            room_item = QTableWidgetItem(s.room)
+            self.table.setItem(row, 5, room_item)
 
-        if not fac_list:
-            self.timetable_layout.addWidget(QLabel("No faculty data to display."))
-            return
+            fac_item = QTableWidgetItem(s.suggested_faculty)
+            fac_item.setToolTip(s.reason)
+            self.table.setItem(row, 6, fac_item)
 
-        # Build grid: rows = timeslots, columns = Mon/Tue/Wed/Thu/Fri/Sat
-        days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        self.table.resizeRowsToContents()
+        layout.addWidget(self.table)
 
-        # Collect all courses per (day_index, timeslot)
-        grid = {}
-        for f in fac_list:
-            for c in f.courses:
-                if ' ' not in c.schedule:
+        # Summary
+        assigned = sum(1 for s in self.suggestions if "(none)" not in s.suggested_faculty)
+        unassigned = len(self.suggestions) - assigned
+        self.summary_label = QLabel(
+            f"Total: {len(self.suggestions)}  |  "
+            f"Can assign: {assigned}  |  "
+            f"Cannot assign: {unassigned}"
+        )
+        layout.addWidget(self.summary_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.apply_btn = QPushButton("Apply Selected")
+        self.apply_btn.clicked.connect(self.accept)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(lambda: self._set_all_checks(Qt.Checked))
+        deselect_all_btn = QPushButton("Deselect All")
+        deselect_all_btn.clicked.connect(lambda: self._set_all_checks(Qt.Unchecked))
+
+        btn_layout.addWidget(select_all_btn)
+        btn_layout.addWidget(deselect_all_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.apply_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _set_all_checks(self, state):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(state)
+
+    def get_accepted_suggestions(self):
+        """Return list of (suggestion, faculty_name) for checked items."""
+        accepted = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                s = self.suggestions[row]
+                if "(none)" not in s.suggested_faculty:
+                    accepted.append(s)
+        return accepted
+
+
+# ---------------------------------------------------------------------------
+# Google Calendar Integration
+# ---------------------------------------------------------------------------
+
+# Try to import Google API libraries; store availability flag
+_GOOGLE_CALENDAR_AVAILABLE = False
+try:
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    _GOOGLE_CALENDAR_AVAILABLE = True
+except ImportError:
+    pass
+
+SCOPES = ['https://www.googleapis.com/auth/calendar.events']
+GCAL_CLIENT_SECRET_FILE = 'client_secret.json'
+GCAL_TOKEN_FILE = 'gcal_token.json'
+GCAL_APP_NAME = 'FacultyWorkloadScheduler'
+
+
+def get_gcal_service():
+    """Authenticate and return a Google Calendar API service, or None on failure.
+
+    Returns
+    -------
+        (service, message) tuple. On success: (service, None).
+        On failure: (None, error_message).
+    """
+    if not _GOOGLE_CALENDAR_AVAILABLE:
+        return None, ("Google Calendar libraries not installed.\n\n"
+                      "Run: pip install google-auth-oauthlib google-api-python-client")
+
+    creds = None
+    token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), GCAL_TOKEN_FILE)
+
+    # Load existing token
+    if os.path.exists(token_path):
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        except Exception as e:
+            log.warning("Could not load token: %s", e)
+
+    # If no (valid) credentials, run OAuth flow
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                log.warning("Token refresh failed: %s", e)
+                creds = None
+
+        if not creds:
+            client_secret_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), GCAL_CLIENT_SECRET_FILE
+            )
+            if not os.path.exists(client_secret_path):
+                return None, (
+                    f"Google Calendar client secret not found.\n\n"
+                    f"Please place your 'client_secret.json' from the "
+                    f"Google Cloud Console in the app directory:\n"
+                    f"{os.path.dirname(os.path.abspath(__file__))}/\n\n"
+                    f"Steps:\n"
+                    f"1. Go to https://console.cloud.google.com/\n"
+                    f"2. Create a project or select existing\n"
+                    f"3. Enable 'Google Calendar API'\n"
+                    f"4. Create OAuth 2.0 credentials (Desktop app type)\n"
+                    f"5. Download JSON and save as '{GCAL_CLIENT_SECRET_FILE}'"
+                )
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    client_secret_path, SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+            except Exception as e:
+                log.error("OAuth flow failed: %s", e)
+                return None, f"OAuth authentication failed:\n{e}"
+
+        # Save token
+        try:
+            with open(token_path, 'w') as f:
+                f.write(creds.to_json())
+            log.info("Saved OAuth token to %s", token_path)
+        except Exception as e:
+            log.warning("Could not save token: %s", e)
+
+    try:
+        service = build('calendar', 'v3', credentials=creds)
+        return service, None
+    except Exception as e:
+        return None, f"Could not create Calendar service:\n{e}"
+
+
+def sync_courses_to_gcal(service, faculty_list, semester_name, calendar_id='primary'):
+    """Create calendar events for all courses, updating existing ones by course ID.
+
+    Parameters
+    ----------
+        service : Google Calendar API service
+        faculty_list : list of Faculty
+        semester_name : str — for event description
+        calendar_id : str — default 'primary'
+
+    Returns
+    -------
+        (created, updated, skipped, errors) tuple of counts and messages.
+    """
+    created = 0
+    updated = 0
+    skipped = 0
+    errors = []
+
+    for fac in faculty_list:
+        for course in fac.courses:
+            try:
+                event_id = f"fls_{fac._id}_{course._id}" if course._id else None
+                start_dt, end_dt, days_str = _parse_schedule(course.schedule)
+
+                if not start_dt or not end_dt:
+                    skipped += 1
+                    errors.append(f"Could not parse schedule '{course.schedule}' for {course.name}")
                     continue
-                day_code, time_slot = c.schedule.split(None, 1)
-                day_indices = DAY_CODES.get(day_code, ())
-                for di in day_indices:
-                    key = (di, time_slot)
-                    grid.setdefault(key, []).append((f.name, c))
 
-        # Create the table
-        table = QTableWidget()
-        table.setColumnCount(len(days) + 1)  # +1 for timeslot label
-        table.setRowCount(len(self.TIMESLOT_LABELS))
-        table.setHorizontalHeaderLabels(["Time"] + days)
+                # Parse day codes
+                day_list = GRID_DAY_INDICES.get(course.schedule.split()[0], [])
+                if not day_list:
+                    skipped += 1
+                    continue
 
-        # Map timeslot to row
-        for row, ts in enumerate(self.TIMESLOT_LABELS):
-            table.setItem(row, 0, QTableWidgetItem(ts))
-            for col in range(1, len(days) + 1):
-                di = col - 1
-                key = (di, ts)
-                entries = grid.get(key, [])
-                if entries:
-                    text = "\n".join(f"{fac}: {c.name} ({c.room or 'no room'})"
-                                     for fac, c in entries)
-                    item = QTableWidgetItem(text)
-                    item.setBackground(QColor(66, 133, 244, 80))
-                    table.setItem(row, col, item)
+                # Build RRULE for recurring weekly
+                byday = []
+                for d in day_list:
+                    weekday_map = {0: 'MO', 1: 'TU', 2: 'WE', 3: 'TH', 4: 'FR', 5: 'SA'}
+                    byday.append(weekday_map[d])
+                rrule = f"FREQ=WEEKLY;BYDAY={','.join(byday)}"
+
+                event_body = {
+                    'summary': f"{course.name} — {fac.name}",
+                    'location': course.room or '',
+                    'description': (
+                        f"Course: {course.name}\n"
+                        f"Faculty: {fac.name}\n"
+                        f"Year Level: {course.year_level}\n"
+                        f"Units: {course.units}\n"
+                        f"Room: {course.room or '—'}\n"
+                        f"Semester: {semester_name}\n"
+                        f"Schedule: {course.schedule}"
+                    ),
+                    'start': {
+                        'dateTime': start_dt.isoformat(),
+                        'timeZone': 'Asia/Manila',
+                    },
+                    'end': {
+                        'dateTime': end_dt.isoformat(),
+                        'timeZone': 'Asia/Manila',
+                    },
+                    'recurrence': [f"RRULE:{rrule}"],
+                }
+
+                # Check if event already exists (via extendedProperties)
+                if event_id:
+                    # Try to find existing by custom ID
+                    existing = service.events().list(
+                        calendarId=calendar_id,
+                        privateExtendedProperty=f'fls_id={event_id}',
+                        maxResults=1
+                    ).execute().get('items', [])
+
+                    if existing:
+                        e = existing[0]
+                        # Update
+                        service.events().update(
+                            calendarId=calendar_id,
+                            eventId=e['id'],
+                            body=event_body
+                        ).execute()
+                        updated += 1
+                    else:
+                        # Create with extended property for tracking
+                        event_body['extendedProperties'] = {
+                            'private': {'fls_id': event_id}
+                        }
+                        service.events().insert(
+                            calendarId=calendar_id,
+                            body=event_body
+                        ).execute()
+                        created += 1
                 else:
-                    table.setItem(row, col, QTableWidgetItem(""))
+                    # No DB ID — just insert
+                    service.events().insert(
+                        calendarId=calendar_id,
+                        body=event_body
+                    ).execute()
+                    created += 1
 
-        table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            except Exception as e:
+                errors.append(f"Error syncing '{course.name}': {e}")
+                skipped += 1
 
-        self.timetable_layout.addWidget(table)
+    return created, updated, skipped, errors
+
+
+def _parse_schedule(schedule):
+    """Parse a schedule string like 'MW 09:20am-10:50am'.
+
+    Returns (start_datetime, end_datetime, day_codes_string) or (None, None, '').
+    Uses a fixed Monday reference date.
+    """
+    if ' ' not in schedule:
+        return None, None, ''
+    day_code, time_range = schedule.split(None, 1)
+    if '-' not in time_range:
+        return None, None, ''
+
+    start_str, end_str = time_range.split('-', 1)
+    # Use a Monday reference (April 6, 2026 was a Monday)
+    ref_date = datetime.date(2026, 4, 6)
+
+    try:
+        start_dt = datetime.datetime.combine(
+            ref_date, datetime.datetime.strptime(start_str.strip(), "%I:%M%p").time()
+        )
+        end_dt = datetime.datetime.combine(
+            ref_date, datetime.datetime.strptime(end_str.strip(), "%I:%M%p").time()
+        )
+        return start_dt, end_dt, day_code
+    except (ValueError, IndexError):
+        return None, None, ''
+
 
 # ---------------------------------------------------------------------------
-# Add Semester Dialog
+# Weekly Schedule Builder (shared helper for dialog + exports)
 # ---------------------------------------------------------------------------
 
-class AddSemesterDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add Semester / Term")
-        self.setModal(True)
-        layout = QFormLayout(self)
+def build_timetable_grid(faculty_list):
+    """Build a 2D grid of timetable data.
 
-        self.name_edit = QLineEdit()
-        year = datetime.date.today().year
-        self.name_edit.setPlaceholderText(f"e.g. AY {year}-{year+1} Sem 2")
-        layout.addRow("Semester name:", self.name_edit)
+    Returns
+    -------
+        grid : dict[(day_index, timeslot_label)] -> list of (faculty_name, course)
+        timeslot_labels : list of str — ordered time ranges
+        day_headers : list of str — ['Mon', 'Tue', ..., 'Sat']
+    """
+    grid = defaultdict(list)
+    for f in faculty_list:
+        for c in f.courses:
+            if ' ' not in c.schedule:
+                continue
+            day_code, time_slot = c.schedule.split(None, 1)
+            if time_slot not in TIMESLOT_LABELS:
+                continue
+            day_indices = GRID_DAY_INDICES.get(day_code, ())
+            for di in day_indices:
+                grid[(di, time_slot)].append((f.name, c))
+    return grid, TIMESLOT_LABELS, GRID_DAYS
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
 
-    def get_name(self):
-        return self.name_edit.text().strip()
+def timetable_cell_text(entries):
+    """Format entries for a timetable cell."""
+    lines = []
+    for fac_name, c in entries:
+        room = c.room or ''
+        parts = [f"{fac_name}: {c.name}"]
+        if room:
+            parts.append(f"({room})")
+        lines.append(' '.join(parts))
+    return '\n'.join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Main Application
@@ -478,25 +879,23 @@ class FacultyWorkloadApp(QMainWindow):
         log.info("Initialising FacultyWorkloadApp …")
         super().__init__()
         self.setWindowTitle("Faculty Workload & Scheduling")
-        self.setGeometry(100, 100, 1200, 900)
+        self.setGeometry(100, 100, 1280, 950)
 
         self.db = Database()
-
-        # Load semesters
         self.semesters = self.db.load_semesters()
         self.active_semester = next((s for s in self.semesters if s.is_active), None)
         if not self.active_semester and self.semesters:
             self.active_semester = self.semesters[0]
 
-        # Load faculty (all, cross-semester)
         self.faculty_list = self.db.load_all_faculty()
-
-        # Load courses for active semester only
         if self.active_semester:
             self.db.load_courses_for_semester(self.active_semester._id, self.faculty_list)
 
         self._is_dark = True
-        self._suppress_cell_change = False  # guard against recursive cell edits
+        self._suppress_cell_change = False
+
+        # Google Calendar service (cached)
+        self._gcal_service = None
 
         self._init_ui()
         self._refresh_all()
@@ -510,7 +909,7 @@ class FacultyWorkloadApp(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setSpacing(6)
 
-        # --- Top bar: semester + theme toggle + bulk import ---
+        # === Top bar ===
         top_bar = QHBoxLayout()
 
         top_bar.addWidget(QLabel("Semester:"))
@@ -519,14 +918,14 @@ class FacultyWorkloadApp(QMainWindow):
         self.semester_sel.currentIndexChanged.connect(self._on_semester_changed)
         top_bar.addWidget(self.semester_sel)
 
-        self.add_sem_btn = QPushButton("+ New Semester")
+        self.add_sem_btn = QPushButton("+ New")
+        self.add_sem_btn.setMaximumWidth(80)
         self.add_sem_btn.clicked.connect(self._add_semester)
-        self.add_sem_btn.setMaximumWidth(120)
         top_bar.addWidget(self.add_sem_btn)
 
-        self.del_sem_btn = QPushButton("Delete Semester")
+        self.del_sem_btn = QPushButton("Del Semester")
+        self.del_sem_btn.setMaximumWidth(100)
         self.del_sem_btn.clicked.connect(self._delete_semester)
-        self.del_sem_btn.setMaximumWidth(120)
         top_bar.addWidget(self.del_sem_btn)
 
         top_bar.addStretch()
@@ -535,39 +934,43 @@ class FacultyWorkloadApp(QMainWindow):
         self.import_btn.clicked.connect(self._bulk_import)
         top_bar.addWidget(self.import_btn)
 
-        self.schedule_btn = QPushButton("Weekly Schedule")
+        self.suggest_btn = QPushButton("Suggest Schedule")
+        self.suggest_btn.clicked.connect(self._auto_schedule)
+        top_bar.addWidget(self.suggest_btn)
+
+        self.gcal_btn = QPushButton("Google Calendar")
+        self.gcal_btn.clicked.connect(self._google_calendar_sync)
+        top_bar.addWidget(self.gcal_btn)
+
+        self.schedule_btn = QPushButton("Weekly View")
         self.schedule_btn.clicked.connect(self._show_weekly_schedule)
         top_bar.addWidget(self.schedule_btn)
 
         self.theme_btn = QPushButton("☀ Light")
-        self.theme_btn.clicked.connect(self._toggle_theme)
         self.theme_btn.setMaximumWidth(80)
+        self.theme_btn.clicked.connect(self._toggle_theme)
         top_bar.addWidget(self.theme_btn)
 
         main_layout.addLayout(top_bar)
 
-        # --- Input section (faculty + course side-by-side) ---
+        # === Input section ===
         input_split = QSplitter(Qt.Horizontal)
 
-        # Left: Faculty input
+        # -- Faculty input --
         fac_group = QGroupBox("Add / Edit Faculty")
         fac_grid = QGridLayout(fac_group)
         fac_grid.setSpacing(4)
-
         fac_grid.addWidget(QLabel("Name:"), 0, 0)
         self.fac_name_input = QLineEdit()
         self.fac_name_input.setPlaceholderText("e.g. Juan dela Cruz")
         fac_grid.addWidget(self.fac_name_input, 0, 1)
-
         fac_grid.addWidget(QLabel("Classification:"), 1, 0)
         self.fac_classification = QComboBox()
         self.fac_classification.addItems(CLASSIFICATIONS)
         fac_grid.addWidget(self.fac_classification, 1, 1)
-
         fac_grid.addWidget(QLabel("Admin:"), 2, 0)
         self.fac_admin_cb = QCheckBox("Administrator")
         fac_grid.addWidget(self.fac_admin_cb, 2, 1)
-
         fac_btn_row = QHBoxLayout()
         self.fac_add_btn = QPushButton("Add Faculty")
         self.fac_add_btn.clicked.connect(self._add_faculty)
@@ -577,43 +980,35 @@ class FacultyWorkloadApp(QMainWindow):
         fac_btn_row.addWidget(self.fac_add_btn)
         fac_btn_row.addWidget(self.fac_delete_btn)
         fac_grid.addLayout(fac_btn_row, 3, 0, 1, 2)
-
         input_split.addWidget(fac_group)
 
-        # Right: Course input
+        # -- Course input --
         course_group = QGroupBox("Add Course")
         course_grid = QGridLayout(course_group)
         course_grid.setSpacing(4)
-
         course_grid.addWidget(QLabel("Faculty:"), 0, 0)
         self.course_faculty_sel = QComboBox()
         course_grid.addWidget(self.course_faculty_sel, 0, 1)
-
         course_grid.addWidget(QLabel("Course:"), 1, 0)
         self.course_name_input = QLineEdit()
         self.course_name_input.setPlaceholderText("e.g. Philo 101")
         course_grid.addWidget(self.course_name_input, 1, 1)
-
         course_grid.addWidget(QLabel("Year Level:"), 2, 0)
-        self.year_level = QComboBox()
-        self.year_level.addItems(YEAR_LEVELS)
-        course_grid.addWidget(self.year_level, 2, 1)
-
+        self.year_level_cb = QComboBox()
+        self.year_level_cb.addItems(YEAR_LEVELS)
+        course_grid.addWidget(self.year_level_cb, 2, 1)
         course_grid.addWidget(QLabel("Units:"), 3, 0)
-        self.units = QComboBox()
-        self.units.addItems(UNIT_OPTIONS)
-        course_grid.addWidget(self.units, 3, 1)
-
+        self.units_cb = QComboBox()
+        self.units_cb.addItems(UNIT_OPTIONS)
+        course_grid.addWidget(self.units_cb, 3, 1)
         course_grid.addWidget(QLabel("Schedule:"), 4, 0)
-        self.schedule = QComboBox()
-        self.schedule.addItems(SCHEDULE_SLOTS)
-        course_grid.addWidget(self.schedule, 4, 1)
-
+        self.schedule_cb = QComboBox()
+        self.schedule_cb.addItems(SCHEDULE_SLOTS)
+        course_grid.addWidget(self.schedule_cb, 4, 1)
         course_grid.addWidget(QLabel("Room:"), 5, 0)
         self.room_input = QLineEdit()
         self.room_input.setPlaceholderText("e.g. F-203")
         course_grid.addWidget(self.room_input, 5, 1)
-
         self.course_add_btn = QPushButton("Add Course")
         self.course_add_btn.clicked.connect(self._add_course)
         self.course_delete_btn = QPushButton("Delete Selected")
@@ -623,30 +1018,28 @@ class FacultyWorkloadApp(QMainWindow):
         btn_row.addWidget(self.course_add_btn)
         btn_row.addWidget(self.course_delete_btn)
         course_grid.addLayout(btn_row, 6, 0, 1, 2)
-
         input_split.addWidget(course_group)
         input_split.setSizes([350, 500])
         main_layout.addWidget(input_split)
 
-        # --- Summary bar ---
+        # === Summary bar ===
         self.summary_label = QLabel()
         self.summary_label.setFrameStyle(QFrame.Panel | QFrame.Sunken)
         self.summary_label.setStyleSheet("padding: 4px 8px; font-size: 12px;")
         main_layout.addWidget(self.summary_label)
 
-        # --- Tables split ---
+        # === Tables ===
         table_split = QSplitter(Qt.Vertical)
 
-        # Faculty table
         fac_label = QLabel("<b>Faculty Workload</b> — double-click to edit")
         table_split.addWidget(fac_label)
 
         self.faculty_table = QTableWidget()
-        self.faculty_table.setColumnCount(7)  # added hidden ID column
+        self.faculty_table.setColumnCount(7)
         self.faculty_table.setHorizontalHeaderLabels(
             ["Name", "Classification", "Admin", "Req. Load", "Current Load", "Status", ""]
         )
-        self.faculty_table.setColumnHidden(6, True)  # hidden ID
+        self.faculty_table.setColumnHidden(6, True)
         self.faculty_table.horizontalHeader().setStretchLastSection(True)
         self.faculty_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.faculty_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -659,16 +1052,15 @@ class FacultyWorkloadApp(QMainWindow):
         self.faculty_table.verticalHeader().setVisible(False)
         table_split.addWidget(self.faculty_table)
 
-        # Course table
         course_label = QLabel("<b>Course Assignments</b> — double-click to edit")
         table_split.addWidget(course_label)
 
         self.course_table = QTableWidget()
-        self.course_table.setColumnCount(7)  # added hidden ID + semester_id
+        self.course_table.setColumnCount(7)
         self.course_table.setHorizontalHeaderLabels(
             ["Faculty", "Course", "Year Level", "Units", "Schedule", "Room", ""]
         )
-        self.course_table.setColumnHidden(6, True)  # hidden ID
+        self.course_table.setColumnHidden(6, True)
         self.course_table.horizontalHeader().setStretchLastSection(True)
         self.course_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.course_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -684,19 +1076,32 @@ class FacultyWorkloadApp(QMainWindow):
         table_split.setSizes([350, 350])
         main_layout.addWidget(table_split, stretch=1)
 
-        # --- Export bar ---
+        # === Export / Action bar ===
         export_layout = QHBoxLayout()
-        self.export_pdf_btn = QPushButton("Export to PDF")
-        self.export_pdf_btn.clicked.connect(self._export_pdf)
-        self.export_csv_btn = QPushButton("Export to CSV")
-        self.export_csv_btn.clicked.connect(self._export_csv)
-        self.clear_all_btn = QPushButton("Clear All Data")
-        self.clear_all_btn.clicked.connect(self._clear_all)
-        self.clear_all_btn.setStyleSheet("color: #e57373;")
+
+        self.export_pdf_btn = QPushButton("Workload PDF")
+        self.export_pdf_btn.clicked.connect(self._export_workload_pdf)
         export_layout.addWidget(self.export_pdf_btn)
+
+        self.export_sched_pdf_btn = QPushButton("Schedule PDF")
+        self.export_sched_pdf_btn.clicked.connect(self._export_schedule_pdf)
+        export_layout.addWidget(self.export_sched_pdf_btn)
+
+        self.export_timetable_png_btn = QPushButton("Timetable PNG")
+        self.export_timetable_png_btn.clicked.connect(self._export_timetable_png)
+        export_layout.addWidget(self.export_timetable_png_btn)
+
+        self.export_csv_btn = QPushButton("CSV")
+        self.export_csv_btn.clicked.connect(self._export_csv)
         export_layout.addWidget(self.export_csv_btn)
+
         export_layout.addStretch()
+
+        self.clear_all_btn = QPushButton("Clear All")
+        self.clear_all_btn.setStyleSheet("color: #e57373;")
+        self.clear_all_btn.clicked.connect(self._clear_all)
         export_layout.addWidget(self.clear_all_btn)
+
         main_layout.addLayout(export_layout)
 
         self._apply_theme()
@@ -726,7 +1131,6 @@ class FacultyWorkloadApp(QMainWindow):
         for s in self.semesters:
             label = f"{'✓ ' if s.is_active else '  '}{s.name}"
             self.semester_sel.addItem(label, s._id)
-        # Select active
         if self.active_semester:
             idx = self.semester_sel.findData(self.active_semester._id)
             if idx >= 0:
@@ -737,25 +1141,36 @@ class FacultyWorkloadApp(QMainWindow):
         if idx < 0 or not self.semesters:
             return
         sem_id = self.semester_sel.itemData(idx)
-        if sem_id == self.active_semester._id:
+        if self.active_semester and sem_id == self.active_semester._id:
             return
-        # Switch active semester
         self.db.set_active_semester(sem_id)
         self.active_semester = next((s for s in self.semesters if s._id == sem_id), None)
-        # Reload courses for new semester
         for f in self.faculty_list:
             f.courses.clear()
         if self.active_semester:
             self.db.load_courses_for_semester(self.active_semester._id, self.faculty_list)
         self._populate_semester_sel()
         self._refresh_all()
-        log.info("Switched to semester: %s", self.active_semester.name if self.active_semester else "None")
+        log.info("Switched to semester: %s",
+                 self.active_semester.name if self.active_semester else "None")
 
     def _add_semester(self):
-        dlg = AddSemesterDialog(self)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add Semester / Term")
+        dlg.setModal(True)
+        layout = QFormLayout(dlg)
+        name_edit = QLineEdit()
+        year = datetime.date.today().year
+        name_edit.setPlaceholderText(f"e.g. AY {year}-{year+1} Sem 2")
+        layout.addRow("Semester name:", name_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addRow(buttons)
+
         if dlg.exec_() != QDialog.Accepted:
             return
-        name = dlg.get_name()
+        name = name_edit.text().strip()
         if not name:
             QMessageBox.warning(self, "Error", "Semester name cannot be empty.")
             return
@@ -785,7 +1200,6 @@ class FacultyWorkloadApp(QMainWindow):
         self.active_semester = next((s for s in self.semesters if s.is_active), None)
         if not self.active_semester and self.semesters:
             self.active_semester = self.semesters[0]
-        # Reload
         for f in self.faculty_list:
             f.courses.clear()
         if self.active_semester:
@@ -831,7 +1245,6 @@ class FacultyWorkloadApp(QMainWindow):
             status_item.setForeground(QBrush(Qt.black if colour.lightness() > 128 else Qt.white))
             self.faculty_table.setItem(row, 5, status_item)
 
-            # Hidden ID
             id_item = QTableWidgetItem(str(fac._id))
             self.faculty_table.setItem(row, 6, id_item)
 
@@ -851,31 +1264,18 @@ class FacultyWorkloadApp(QMainWindow):
         self.course_table.setRowCount(len(all_courses))
         for row, (fac_name, fac, course) in enumerate(all_courses):
             fac_item = QTableWidgetItem(fac_name)
-            fac_item.setFlags(fac_item.flags() & ~Qt.ItemIsEditable)  # faculty is set by dropdown
+            fac_item.setFlags(fac_item.flags() & ~Qt.ItemIsEditable)
             self.course_table.setItem(row, 0, fac_item)
 
             name_item = QTableWidgetItem(course.name)
             name_item.setFlags(name_item.flags() | Qt.ItemIsEditable)
             name_item.setData(Qt.UserRole, course._id)
             self.course_table.setItem(row, 1, name_item)
+            self.course_table.setItem(row, 2, QTableWidgetItem(course.year_level))
+            self.course_table.setItem(row, 3, QTableWidgetItem(str(course.units)))
+            self.course_table.setItem(row, 4, QTableWidgetItem(course.schedule))
+            self.course_table.setItem(row, 5, QTableWidgetItem(course.room))
 
-            yr_item = QTableWidgetItem(course.year_level)
-            yr_item.setFlags(yr_item.flags() | Qt.ItemIsEditable)
-            self.course_table.setItem(row, 2, yr_item)
-
-            units_item = QTableWidgetItem(str(course.units))
-            units_item.setFlags(units_item.flags() | Qt.ItemIsEditable)
-            self.course_table.setItem(row, 3, units_item)
-
-            sched_item = QTableWidgetItem(course.schedule)
-            sched_item.setFlags(sched_item.flags() | Qt.ItemIsEditable)
-            self.course_table.setItem(row, 4, sched_item)
-
-            room_item = QTableWidgetItem(course.room)
-            room_item.setFlags(room_item.flags() | Qt.ItemIsEditable)
-            self.course_table.setItem(row, 5, room_item)
-
-            # Hidden ID
             id_item = QTableWidgetItem(str(course._id))
             self.course_table.setItem(row, 6, id_item)
 
@@ -900,20 +1300,21 @@ class FacultyWorkloadApp(QMainWindow):
         on_target = sum(1 for f in self.faculty_list if f.load_status_category() == 'on_target')
         pt = sum(1 for f in self.faculty_list if f.load_status_category() == 'part_time')
         sem = self.active_semester.name if self.active_semester else "No semester"
+        has_gcal = " ✓" if self._gcal_service else ""
         self.summary_label.setText(
             f"[{sem}]  Faculty: {total_fac}  |  Courses: {total_courses}  |  "
             f"Under: {under}  |  On target: {on_target}  |  Over: {over}  |  "
-            f"Part-time: {pt}"
+            f"Part-time: {pt}  |  Google Calendar:{has_gcal}"
         )
 
-    # -- In-place editing (Faculty) ----------------------------------------
+    # -- In-place editing (Facility) ---------------------------------------
 
     def _on_faculty_cell_edited(self, item):
         if self._suppress_cell_change:
             return
         row = item.row()
         col = item.column()
-        if col > 2:  # only name, classification, admin are editable
+        if col > 2:
             return
 
         fac_id_item = self.faculty_table.item(row, 6)
@@ -927,31 +1328,28 @@ class FacultyWorkloadApp(QMainWindow):
         new_value = item.text().strip()
         old_name = faculty.name
 
-        if col == 0:  # Name
-            if not new_value:
-                QMessageBox.warning(self, "Error", "Name cannot be empty.")
-                self._refresh_all()
-                return
-            if new_value != faculty.name and any(f.name == new_value for f in self.faculty_list):
-                QMessageBox.warning(self, "Duplicate", "A faculty member with this name already exists.")
-                self._refresh_all()
-                return
-            faculty.name = new_value
-        elif col == 1:  # Classification
-            if new_value not in CLASSIFICATIONS:
-                QMessageBox.warning(self, "Error", f"Classification must be one of: {', '.join(CLASSIFICATIONS)}")
-                self._refresh_all()
-                return
-            faculty.classification = new_value
-            faculty.required_load = faculty.calculate_required_load()
-        elif col == 2:  # Admin
-            faculty.is_admin = new_value.lower() in ('yes', 'true', '1')
-            faculty.required_load = faculty.calculate_required_load()
+        try:
+            if col == 0:
+                if not new_value:
+                    raise ValueError("Name cannot be empty")
+                if new_value != faculty.name and any(f.name == new_value for f in self.faculty_list):
+                    raise ValueError("A faculty member with this name already exists")
+                faculty.name = new_value
+            elif col == 1:
+                if new_value not in CLASSIFICATIONS:
+                    raise ValueError(f"Must be one of: {', '.join(CLASSIFICATIONS)}")
+                faculty.classification = new_value
+                faculty.required_load = faculty.calculate_required_load()
+            elif col == 2:
+                faculty.is_admin = new_value.lower() in ('yes', 'true', '1')
+                faculty.required_load = faculty.calculate_required_load()
 
-        # Persist
-        self.db.update_faculty(faculty)
-        log.info("Edited faculty %s -> %s", old_name, faculty.name)
-        self._refresh_all()
+            self.db.update_faculty(faculty)
+            log.info("Edited faculty %s", faculty.name)
+            self._refresh_all()
+        except ValueError as e:
+            QMessageBox.warning(self, "Edit Error", str(e))
+            self._refresh_all()
 
     # -- In-place editing (Course) -----------------------------------------
 
@@ -960,7 +1358,7 @@ class FacultyWorkloadApp(QMainWindow):
             return
         row = item.row()
         col = item.column()
-        if col == 0:  # faculty column is read-only
+        if col == 0:
             return
 
         id_item = self.course_table.item(row, 6)
@@ -968,7 +1366,6 @@ class FacultyWorkloadApp(QMainWindow):
             return
         course_id = int(id_item.text())
 
-        # Find the course across all faculty
         course = None
         faculty = None
         for f in self.faculty_list:
@@ -979,45 +1376,37 @@ class FacultyWorkloadApp(QMainWindow):
                     break
             if course:
                 break
-
         if not course:
             return
 
         new_value = item.text().strip()
+
         try:
-            if col == 1:  # Course name
+            if col == 1:
                 if not new_value:
-                    QMessageBox.warning(self, "Error", "Course name cannot be empty.")
-                    self._refresh_all()
-                    return
+                    raise ValueError("Course name cannot be empty")
                 course.name = new_value
-            elif col == 2:  # Year level
+            elif col == 2:
                 if new_value not in YEAR_LEVELS:
-                    QMessageBox.warning(self, "Error", f"Year level must be one of: {', '.join(YEAR_LEVELS)}")
-                    self._refresh_all()
-                    return
+                    raise ValueError(f"Year level must be one of: {', '.join(YEAR_LEVELS)}")
                 course.year_level = new_value
-            elif col == 3:  # Units
+            elif col == 3:
                 units = int(new_value)
                 if units not in (3, 6):
-                    QMessageBox.warning(self, "Error", "Units must be 3 or 6.")
-                    self._refresh_all()
-                    return
+                    raise ValueError("Units must be 3 or 6")
                 course.units = units
-            elif col == 4:  # Schedule
+            elif col == 4:
                 if new_value not in SCHEDULE_SLOTS:
-                    QMessageBox.warning(self, "Error", f"'{new_value}' is not a valid schedule slot.")
-                    self._refresh_all()
-                    return
+                    raise ValueError(f"Not a valid schedule slot")
                 course.schedule = new_value
-            elif col == 5:  # Room
+            elif col == 5:
                 course.room = new_value
 
             self.db.update_course(course)
-            log.info("Edited course id=%s: col %d = '%s'", course_id, col, new_value)
+            log.info("Edited course id=%s", course_id)
             self._refresh_all()
-        except ValueError:
-            QMessageBox.warning(self, "Error", "Invalid value entered.")
+        except ValueError as e:
+            QMessageBox.warning(self, "Edit Error", str(e))
             self._refresh_all()
 
     # -- Faculty operations -------------------------------------------------
@@ -1030,14 +1419,11 @@ class FacultyWorkloadApp(QMainWindow):
         if not name:
             QMessageBox.warning(self, "Input Error", "Please enter a faculty name.")
             return
-
         if any(f.name == name for f in self.faculty_list):
             QMessageBox.warning(self, "Duplicate", "A faculty member with this name already exists.")
             return
-
         classification = self.fac_classification.currentText()
         is_admin = self.fac_admin_cb.isChecked()
-
         faculty = Faculty(name, classification, is_admin)
         self.db.add_faculty(faculty)
         self.faculty_list.append(faculty)
@@ -1051,7 +1437,6 @@ class FacultyWorkloadApp(QMainWindow):
             return
         row = rows[0].row()
         name = self.faculty_table.item(row, 0).text()
-
         reply = QMessageBox.question(
             self, "Confirm Delete",
             f"Delete faculty '{name}' and all their courses?",
@@ -1059,7 +1444,6 @@ class FacultyWorkloadApp(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-
         self.db.delete_faculty_by_name(name)
         self.faculty_list = [f for f in self.faculty_list if f.name != name]
         self._refresh_all()
@@ -1087,24 +1471,20 @@ class FacultyWorkloadApp(QMainWindow):
     def _add_course(self):
         course_name = self.course_name_input.text().strip()
         faculty_name = self.course_faculty_sel.currentText()
-
         if not course_name or not faculty_name:
-            QMessageBox.warning(self, "Input Error", "Please enter a course name and select a faculty.")
+            QMessageBox.warning(self, "Input Error",
+                                "Please enter a course name and select a faculty.")
             return
-
         faculty = self._find_faculty_by_name(faculty_name)
         if not faculty:
             QMessageBox.warning(self, "Error", "Selected faculty not found.")
             return
-
-        year_level = self.year_level.currentText()
-        units = int(self.units.currentText())
-        schedule = self.schedule.currentText()
+        year_level = self.year_level_cb.currentText()
+        units = int(self.units_cb.currentText())
+        schedule = self.schedule_cb.currentText()
         room = self.room_input.text().strip()
-
         course = Course(course_name, year_level, units, schedule, room,
                         self.active_semester._id if self.active_semester else None)
-
         conflict = self._find_conflicts(faculty, course)
         if conflict:
             QMessageBox.warning(
@@ -1113,7 +1493,6 @@ class FacultyWorkloadApp(QMainWindow):
                 f"({conflict.schedule}) for {faculty_name}."
             )
             return
-
         self.db.add_course(faculty._id, course)
         faculty.courses.append(course)
         self._refresh_all()
@@ -1147,7 +1526,6 @@ class FacultyWorkloadApp(QMainWindow):
         schedule = self.course_table.item(row, 4).text()
         course_id_item = self.course_table.item(row, 6)
         course_id = int(course_id_item.text()) if course_id_item else -1
-
         reply = QMessageBox.question(
             self, "Confirm Delete",
             f"Delete course '{course_name}' ({schedule}) for {fac_name}?",
@@ -1155,14 +1533,12 @@ class FacultyWorkloadApp(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-
         faculty = self._find_faculty_by_name(fac_name)
         if faculty:
             faculty.courses = [c for c in faculty.courses
                                if not (c.name == course_name and c.schedule == schedule)]
         if course_id > 0:
             self.db.delete_course(course_id)
-
         self._refresh_all()
         log.info("Deleted course '%s' from %s", course_name, fac_name)
 
@@ -1183,22 +1559,12 @@ class FacultyWorkloadApp(QMainWindow):
         if action == delete_action:
             self._delete_selected_course()
 
-    # -- Bulk import from CSV ------------------------------------------------
+    # -- Bulk import --------------------------------------------------------
 
     def _bulk_import(self):
-        """Import faculty and courses from a CSV file.
-
-        Expected columns:
-          Faculty Name, Classification, Is Admin, Course Name,
-          Year Level, Units, Schedule, Room
-        Header row is required.
-        """
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Import CSV", "", "CSV Files (*.csv)"
-        )
+        file_path, _ = QFileDialog.getOpenFileName(self, "Import CSV", "", "CSV Files (*.csv)")
         if not file_path:
             return
-
         if not self.active_semester:
             QMessageBox.warning(self, "Error", "Please create or select a semester first.")
             return
@@ -1208,7 +1574,6 @@ class FacultyWorkloadApp(QMainWindow):
             with open(file_path, 'r', newline='', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-
             if not rows:
                 QMessageBox.information(self, "Import", "CSV file is empty.")
                 return
@@ -1218,7 +1583,7 @@ class FacultyWorkloadApp(QMainWindow):
             skipped = 0
             errors = []
 
-            for i, row in enumerate(rows, start=2):  # 2 = header is row 1
+            for i, row in enumerate(rows, start=2):
                 fac_name = row.get('Faculty Name', '').strip()
                 classification = row.get('Classification', '').strip()
                 is_admin_str = row.get('Is Admin', '0').strip()
@@ -1233,7 +1598,6 @@ class FacultyWorkloadApp(QMainWindow):
                     errors.append(f"Row {i}: missing Faculty Name or Course Name")
                     continue
 
-                # Find or create faculty
                 faculty = self._find_faculty_by_name(fac_name)
                 if not faculty:
                     if classification not in CLASSIFICATIONS:
@@ -1257,7 +1621,6 @@ class FacultyWorkloadApp(QMainWindow):
 
                 course = Course(course_name, year_level, units, schedule, room,
                                 self.active_semester._id)
-                # Check conflicts
                 conflict = self._find_conflicts(faculty, course)
                 if conflict:
                     skipped += 1
@@ -1280,10 +1643,212 @@ class FacultyWorkloadApp(QMainWindow):
             QMessageBox.information(self, "Import Results", msg)
             log.info("CSV import: %d faculty, %d courses added, %d skipped",
                      added_faculty, added_courses, skipped)
-
         except Exception as e:
             log.error("CSV import failed: %s", e)
             QMessageBox.critical(self, "Import Failed", f"Error: {e}")
+
+    # -- Auto-schedule suggestions ------------------------------------------
+
+    def _auto_schedule(self):
+        """Open the auto-scheduler dialog."""
+        if not self.active_semester:
+            QMessageBox.warning(self, "Error", "Please select a semester first.")
+            return
+
+        # Find all courses currently assigned this semester
+        assigned_names = set()
+        for f in self.faculty_list:
+            for c in f.courses:
+                assigned_names.add(c.name)
+
+        # We'll suggest for courses that are NOT yet assigned.
+        # In practice, the user might want to use this for NEW courses.
+        # For now, we treat ALL possible courses as unassigned.
+        # But that's not useful — let's instead ask the user what to do.
+
+        # Simplest approach: treat the current list as "to optimize" and
+        # suggest a better assignment, replacing current ones.
+        # Alternative: let user input courses in a text area.
+
+        # Let's implement a dialog where the user can paste course lines.
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Auto-Schedule: Enter Courses")
+        dlg.setMinimumSize(500, 300)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel(
+            "Enter course details (one per line):\n"
+            "Course Name, Year Level, Units, Schedule, Room (optional)\n"
+            "Example: Philo 101, BA 1, 3, MW 07:40am-09:10am, F-203"
+        ))
+
+        self._suggest_edit = QTextEdit()
+        self._suggest_edit.setPlaceholderText(
+            "Philo 101, BA 1, 3, MW 07:40am-09:10am, F-203\n"
+            "Math 102, BA 2, 3, TTh 09:20am-10:50am, M-105"
+        )
+        layout.addWidget(self._suggest_edit)
+
+        # Preset: use all courses already assigned + some suggestions
+        hint_text = ""
+        for f in self.faculty_list:
+            for c in f.courses:
+                hint_text += f"{c.name}, {c.year_level}, {c.units}, {c.schedule}, {c.room}\n"
+        if not hint_text:
+            hint_text = "Philo 101, BA 1, 3, MW 07:40am-09:10am, F-203\n"
+        self._suggest_edit.setPlainText(hint_text.rstrip('\n'))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        # Parse the input
+        raw = self._suggest_edit.toPlainText().strip()
+        if not raw:
+            QMessageBox.warning(self, "Error", "No courses entered.")
+            return
+
+        unassigned = []
+        parse_errors = []
+        for line in raw.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) < 4:
+                parse_errors.append(f"Too few fields: {line}")
+                continue
+            cname = parts[0]
+            yr = parts[1] if parts[1] in YEAR_LEVELS else "BA 1"
+            try:
+                u = int(parts[2])
+                if u not in (3, 6):
+                    u = 3
+            except ValueError:
+                u = 3
+            sched = parts[3] if parts[3] in SCHEDULE_SLOTS else SCHEDULE_SLOTS[0]
+            room = parts[4] if len(parts) > 4 else ''
+            unassigned.append(Course(cname, yr, u, sched, room))
+
+        if not unassigned:
+            QMessageBox.warning(self, "Error", "No valid courses parsed.")
+            return
+
+        if parse_errors:
+            log.warning("Parse errors: %s", parse_errors)
+
+        # Run optimizer
+        suggestions = SchedulingOptimizer.optimize(unassigned, self.faculty_list)
+
+        if not suggestions:
+            QMessageBox.information(self, "Result", "No suggestions could be generated.")
+            return
+
+        # Show dialog
+        dlg2 = ScheduleSuggestDialog(suggestions, self)
+        if dlg2.exec_() != QDialog.Accepted:
+            return
+
+        accepted = dlg2.get_accepted_suggestions()
+        if not accepted:
+            QMessageBox.information(self, "Result", "No suggestions were accepted.")
+            return
+
+        # Apply accepted suggestions
+        applied = 0
+        for s in accepted:
+            faculty = self._find_faculty_by_name(s.suggested_faculty)
+            if not faculty:
+                log.warning("Faculty '%s' no longer exists", s.suggested_faculty)
+                continue
+            course = Course(s.course_name, s.year_level, s.units, s.schedule, s.room,
+                            self.active_semester._id)
+            # Check for conflict one more time
+            if self._find_conflicts(faculty, course):
+                log.warning("Conflict detected on apply for '%s'", s.course_name)
+                continue
+            self.db.add_course(faculty._id, course)
+            faculty.courses.append(course)
+            applied += 1
+
+        self._refresh_all()
+        QMessageBox.information(
+            self, "Schedule Applied",
+            f"{applied} of {len(accepted)} course(s) assigned successfully."
+        )
+        log.info("Auto-schedule: %d courses applied", applied)
+
+    # -- Google Calendar Sync -----------------------------------------------
+
+    def _google_calendar_sync(self):
+        """Connect or sync with Google Calendar."""
+        if not _GOOGLE_CALENDAR_AVAILABLE:
+            QMessageBox.critical(
+                self, "Dependencies Missing",
+                "Google Calendar libraries not installed.\n\n"
+                "Run:  pip install google-auth-oauthlib google-api-python-client"
+            )
+            return
+
+        if self._gcal_service is None:
+            # First-time connection
+            service, err = get_gcal_service()
+            if err:
+                QMessageBox.critical(self, "Google Calendar Error", err)
+                return
+            self._gcal_service = service
+            QMessageBox.information(
+                self, "Connected",
+                "Connected to Google Calendar successfully!\n\n"
+                "Click the button again to sync your courses."
+            )
+            self._refresh_summary()
+            log.info("Connected to Google Calendar")
+            return
+
+        # Already connected — sync courses
+        if not self.active_semester:
+            QMessageBox.warning(self, "Error", "No active semester to sync.")
+            return
+
+        # Quick sanity: make sure we have data
+        total_courses = sum(len(f.courses) for f in self.faculty_list)
+        if total_courses == 0:
+            QMessageBox.information(self, "No Data", "No courses to sync.")
+            return
+
+        progress = QProgressDialog("Syncing to Google Calendar…", None, 0, 100, self)
+        progress.setWindowTitle("Please wait")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setValue(10)
+
+        try:
+            sem_name = self.active_semester.name
+            created, updated, skipped, errors = sync_courses_to_gcal(
+                self._gcal_service, self.faculty_list, sem_name
+            )
+            progress.setValue(90)
+
+            msg = (f"Google Calendar sync complete.\n\n"
+                   f"Events created: {created}\n"
+                   f"Events updated: {updated}\n"
+                   f"Skipped: {skipped}")
+            if errors:
+                msg += f"\n\nWarnings ({len(errors)}):\n" + "\n".join(errors[:5])
+                if len(errors) > 5:
+                    msg += f"\n... and {len(errors) - 5} more"
+            QMessageBox.information(self, "Sync Complete", msg)
+            log.info("Google Calendar sync: %d created, %d updated, %d skipped",
+                     created, updated, skipped)
+        except Exception as e:
+            log.error("Google Calendar sync failed: %s", e)
+            QMessageBox.critical(self, "Sync Failed", f"Error: {e}")
+        finally:
+            progress.setValue(100)
 
     # -- Weekly Schedule Dialog ---------------------------------------------
 
@@ -1291,10 +1856,79 @@ class FacultyWorkloadApp(QMainWindow):
         if not self.faculty_list or not any(f.courses for f in self.faculty_list):
             QMessageBox.information(self, "No Data", "No courses assigned yet to display a schedule.")
             return
-        dlg = WeeklyScheduleDialog(self.faculty_list, self)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Weekly Schedule View")
+        dlg.resize(1100, 700)
+
+        layout = QVBoxLayout(dlg)
+
+        # Filter
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Show faculty:"))
+        fac_filter = QComboBox()
+        fac_filter.addItem("All Faculty")
+        for f in self.faculty_list:
+            fac_filter.addItem(f.name)
+        filter_layout.addWidget(fac_filter)
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        timetable_widget = QWidget()
+        timetable_layout = QVBoxLayout(timetable_widget)
+        scroll.setWidget(timetable_widget)
+        layout.addWidget(scroll)
+
+        def rebuild_schedule():
+            # Clear
+            while timetable_layout.count():
+                child = timetable_layout.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+
+            filter_name = fac_filter.currentText()
+            if filter_name == "All Faculty":
+                flist = self.faculty_list
+            else:
+                flist = [f for f in self.faculty_list if f.name == filter_name]
+
+            if not flist:
+                timetable_layout.addWidget(QLabel("No data to display."))
+                return
+
+            grid, _, _ = build_timetable_grid(flist)
+
+            table = QTableWidget()
+            table.setColumnCount(7)
+            table.setHorizontalHeaderLabels(["Time"] + GRID_DAYS)
+            table.setRowCount(len(TIMESLOT_LABELS))
+
+            for row_idx, ts in enumerate(TIMESLOT_LABELS):
+                table.setItem(row_idx, 0, QTableWidgetItem(ts))
+                for col_idx in range(1, 7):
+                    day_idx = col_idx - 1
+                    entries = grid.get((day_idx, ts), [])
+                    if entries:
+                        text = timetable_cell_text(entries)
+                        item = QTableWidgetItem(text)
+                        item.setBackground(QColor(66, 133, 244, 80))
+                        table.setItem(row_idx, col_idx, item)
+                    else:
+                        table.setItem(row_idx, col_idx, QTableWidgetItem(""))
+
+            table.horizontalHeader().setStretchLastSection(True)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            timetable_layout.addWidget(table)
+
+        fac_filter.currentIndexChanged.connect(rebuild_schedule)
+        rebuild_schedule()
         dlg.exec_()
 
-    # -- Export -------------------------------------------------------------
+    # -- Export: Workload PDF -----------------------------------------------
 
     @staticmethod
     def _pdf_table_style():
@@ -1303,70 +1937,245 @@ class FacultyWorkloadApp(QMainWindow):
             ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 12),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
             ('BACKGROUND', (0, 1), (-1, -1), rl_colors.beige),
             ('TEXTCOLOR', (0, 1), (-1, -1), rl_colors.black),
             ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
             ('TOPPADDING', (0, 1), (-1, -1), 4),
             ('BOTTOMPADDING', (0, 1), (-1, -1), 4),
             ('GRID', (0, 0), (-1, -1), 1, rl_colors.black),
         ])
 
-    def _export_pdf(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save PDF", "", "PDF Files (*.pdf)")
+    def _export_workload_pdf(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Workload PDF", "", "PDF Files (*.pdf)")
         if not file_path:
             return
-
-        log.info("Exporting PDF to %s", file_path)
+        log.info("Exporting workload PDF to %s", file_path)
         try:
             doc = SimpleDocTemplate(file_path, pagesize=landscape(letter))
             styles = getSampleStyleSheet()
             elements = []
-
-            # Title
             sem_name = self.active_semester.name if self.active_semester else "All Semesters"
-            elements.append(Paragraph(
-                f"Faculty Workload Report — {sem_name}", styles['Title']))
+            elements.append(Paragraph(f"Faculty Workload Report — {sem_name}", styles['Title']))
             elements.append(Spacer(1, 12))
 
-            # Faculty table
-            fac_header = ["Name", "Class", "Admin", "Req", "Load", "Status"]
-            fac_data = [fac_header]
+            headers = ["Name", "Class", "Admin", "Req", "Load", "Status"]
+            data = [headers]
             for f in self.faculty_list:
-                fac_data.append([
-                    f.name, f.classification, "Yes" if f.is_admin else "No",
-                    str(f.required_load), str(f.current_load()), f.load_status(),
-                ])
-            ft = Table(fac_data)
+                data.append([f.name, f.classification, "Yes" if f.is_admin else "No",
+                             str(f.required_load), str(f.current_load()), f.load_status()])
+            ft = RLTable(data)
             ft.setStyle(self._pdf_table_style())
             elements.append(Paragraph("<b>Faculty Workload</b>", styles['Heading2']))
             elements.append(ft)
             elements.append(Spacer(1, 16))
 
-            # Course table with Room
-            course_header = ["Faculty", "Course", "Year", "Units", "Schedule", "Room"]
-            course_data = [course_header]
+            course_headers = ["Faculty", "Course", "Year", "Units", "Schedule", "Room"]
+            course_data = [course_headers]
             for f in self.faculty_list:
                 for c in f.courses:
-                    course_data.append([f.name, c.name, c.year_level,
-                                        str(c.units), c.schedule, c.room or '—'])
+                    course_data.append([f.name, c.name, c.year_level, str(c.units),
+                                        c.schedule, c.room or '—'])
             if len(course_data) > 1:
-                ct = Table(course_data)
+                ct = RLTable(course_data)
                 ct.setStyle(self._pdf_table_style())
                 elements.append(Paragraph("<b>Course Assignments</b>", styles['Heading2']))
                 elements.append(ct)
-            else:
-                elements.append(Paragraph("No course assignments.", styles['Normal']))
+
+            doc.build(elements)
+            QMessageBox.information(self, "Export Successful", f"Workload PDF saved:\n{file_path}")
+            log.info("Workload PDF export complete: %s", file_path)
+        except Exception as e:
+            log.error("Workload PDF export failed: %s", e)
+            QMessageBox.critical(self, "Export Failed", f"Error: {e}")
+
+    # -- Export: Schedule PDF (timetable as PDF) ----------------------------
+
+    def _export_schedule_pdf(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Schedule PDF", "", "PDF Files (*.pdf)"
+        )
+        if not file_path:
+            return
+
+        has_data = any(f.courses for f in self.faculty_list)
+        if not has_data:
+            QMessageBox.information(self, "No Data", "No courses to export.")
+            return
+
+        log.info("Exporting schedule PDF to %s", file_path)
+        try:
+            doc = SimpleDocTemplate(file_path, pagesize=landscape(A4),
+                                    leftMargin=20, rightMargin=20,
+                                    topMargin=20, bottomMargin=20)
+            styles = getSampleStyleSheet()
+            elements = []
+
+            sem_name = self.active_semester.name if self.active_semester else "All Semesters"
+            title_style = ParagraphStyle('ScheduleTitle', parent=styles['Title'],
+                                         alignment=TA_CENTER, fontSize=16)
+            elements.append(Paragraph(f"Weekly Schedule — {sem_name}", title_style))
+            elements.append(Spacer(1, 12))
+
+            for fac in self.faculty_list:
+                if not fac.courses:
+                    continue
+                elements.append(Paragraph(
+                    f"<b>{fac.name}</b> — {fac.classification}",
+                    styles['Heading3']
+                ))
+                elements.append(Spacer(1, 6))
+
+                # Build timetable for this single faculty member
+                grid, _, days = build_timetable_grid([fac])
+
+                # Create table: rows = timeslots, cols = time label + days
+                header = ["Time"] + days
+                data = [header]
+                for ts in TIMESLOT_LABELS:
+                    row = [ts]
+                    for day_idx in range(6):
+                        entries = grid.get((day_idx, ts), [])
+                        if entries:
+                            text = ' / '.join(
+                                f"{cn.name}" + (f" ({cn.room})" if cn.room else "")
+                                for fn, cn in entries
+                            )
+                        else:
+                            text = ''
+                        row.append(text)
+                    data.append(row)
+
+                # Build column widths
+                col_widths = [1.2 * inch] + [0.9 * inch] * 6
+
+                t = RLTable(data, colWidths=col_widths, repeatRows=1)
+                t.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), rl_colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), rl_colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 8),
+                    ('FONTSIZE', (0, 1), (-1, -1), 7),
+                    ('BACKGROUND', (0, 1), (-1, -1), rl_colors.beige),
+                    ('TEXTCOLOR', (0, 1), (-1, -1), rl_colors.black),
+                    ('GRID', (0, 0), (-1, -1), 0.5, rl_colors.black),
+                    ('TOPPADDING', (0, 0), (-1, -1), 2),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    # Light fill for cells with content
+                    *[('BACKGROUND', (c, r), (c, r), rl_colors.Color(0.85, 0.92, 1.0))
+                      for r in range(1, len(data))
+                      for c in range(1, len(header))
+                      if data[r][c]],
+                ]))
+                elements.append(t)
+                elements.append(Spacer(1, 16))
 
             doc.build(elements)
             QMessageBox.information(self, "Export Successful",
-                                    f"Data exported to PDF:\n{file_path}")
-            log.info("PDF export complete: %s", file_path)
+                                    f"Schedule PDF saved:\n{file_path}")
+            log.info("Schedule PDF export complete: %s", file_path)
         except Exception as e:
-            log.error("PDF export failed: %s", e)
+            log.error("Schedule PDF export failed: %s", e)
             QMessageBox.critical(self, "Export Failed", f"Error: {e}")
+
+    # -- Export: Timetable PNG ----------------------------------------------
+
+    def _export_timetable_png(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Timetable PNG", "", "PNG Images (*.png)"
+        )
+        if not file_path:
+            return
+
+        has_data = any(f.courses for f in self.faculty_list)
+        if not has_data:
+            QMessageBox.information(self, "No Data", "No courses to export.")
+            return
+
+        log.info("Exporting timetable PNG to %s", file_path)
+        try:
+            # Build the timetable QTableWidget
+            table = QTableWidget()
+            table.setColumnCount(7)
+            table.setHorizontalHeaderLabels(["Time"] + GRID_DAYS)
+            table.setRowCount(len(TIMESLOT_LABELS))
+
+            grid, _, _ = build_timetable_grid(self.faculty_list)
+
+            for row_idx, ts in enumerate(TIMESLOT_LABELS):
+                time_item = QTableWidgetItem(ts)
+                time_item.setFlags(Qt.ItemIsEnabled)
+                font = time_item.font()
+                font.setBold(True)
+                font.setPointSize(9)
+                time_item.setFont(font)
+                table.setItem(row_idx, 0, time_item)
+
+                for col_idx in range(1, 7):
+                    day_idx = col_idx - 1
+                    entries = grid.get((day_idx, ts), [])
+                    if entries:
+                        text = timetable_cell_text(entries)
+                        item = QTableWidgetItem(text)
+                        item.setBackground(QColor(220, 235, 255))
+                        item.setFlags(Qt.ItemIsEnabled)
+                        font2 = item.font()
+                        font2.setPointSize(8)
+                        item.setFont(font2)
+                        table.setItem(row_idx, col_idx, item)
+                    else:
+                        empty = QTableWidgetItem("")
+                        empty.setFlags(Qt.ItemIsEnabled)
+                        table.setItem(row_idx, col_idx, empty)
+
+            # Style the table
+            table.horizontalHeader().setStretchLastSection(True)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.setMinimumWidth(800)
+
+            # Render to pixmap — show briefly then hide
+            # Use a temporary dialog to ensure proper layout
+            temp_dlg = QDialog(self)
+            temp_dlg.setWindowFlags(Qt.FramelessWindowHint)
+            temp_dlg.resize(900, 600)
+            temp_layout = QVBoxLayout(temp_dlg)
+            temp_layout.addWidget(table)
+            temp_dlg.show()
+            # Force layout
+            QApplication.processEvents()
+
+            # Compute full size
+            table.resizeRowsToContents()
+            table.resizeColumnsToContents()
+            total_width = table.horizontalHeader().length() + 2
+            total_height = table.verticalHeader().length() + 2
+            table.setFixedSize(total_width, total_height)
+
+            # Grab
+            pixmap = QPixmap(table.size())
+            pixmap.fill(Qt.white)
+            painter = QPainter(pixmap)
+            table.render(painter)
+            painter.end()
+
+            temp_dlg.hide()
+            temp_dlg.deleteLater()
+
+            pixmap.save(file_path, 'PNG')
+            QMessageBox.information(self, "Export Successful",
+                                    f"Timetable PNG saved:\n{file_path}")
+            log.info("Timetable PNG export complete: %s", file_path)
+        except Exception as e:
+            log.error("Timetable PNG export failed: %s", e)
+            QMessageBox.critical(self, "Export Failed", f"Error: {e}")
+
+    # -- Export: CSV --------------------------------------------------------
 
     def _export_csv(self):
         file_path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV Files (*.csv)")
@@ -1395,14 +2204,13 @@ class FacultyWorkloadApp(QMainWindow):
                         writer.writerow([f.name, c.name, c.year_level,
                                          c.units, c.schedule, c.room])
 
-            QMessageBox.information(self, "Export Successful",
-                                    f"Data exported to CSV:\n{file_path}")
+            QMessageBox.information(self, "Export Successful", f"Data exported to CSV:\n{file_path}")
             log.info("CSV export complete: %s", file_path)
         except Exception as e:
             log.error("CSV export failed: %s", e)
             QMessageBox.critical(self, "Export Failed", f"Error: {e}")
 
-    # -- Danger zone --------------------------------------------------------
+    # -- Clear all ----------------------------------------------------------
 
     def _clear_all(self):
         reply = QMessageBox.warning(
@@ -1413,12 +2221,8 @@ class FacultyWorkloadApp(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-
-        reply2 = QMessageBox.question(
-            self, "Confirm",
-            "This cannot be undone. Proceed?",
-            QMessageBox.Yes | QMessageBox.No
-        )
+        reply2 = QMessageBox.question(self, "Confirm", "This cannot be undone. Proceed?",
+                                       QMessageBox.Yes | QMessageBox.No)
         if reply2 != QMessageBox.Yes:
             return
 
@@ -1427,7 +2231,6 @@ class FacultyWorkloadApp(QMainWindow):
         self.db.conn.execute("DELETE FROM semesters")
         self.db.conn.commit()
 
-        # Recreate default semester
         year = datetime.date.today().year
         self.db.conn.execute(
             "INSERT INTO semesters (name, is_active) VALUES (?, 1)",
